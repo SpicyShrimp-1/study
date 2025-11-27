@@ -1,0 +1,7 @@
+discord.py
+yfinance
+investpy
+pandas
+requests
+google-generativeai
+Flask
