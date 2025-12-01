@@ -9,13 +9,12 @@ import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 import google.generativeai as genai
-from secedgar.filings import get_filings, FilingType
+import aiohttp
 import asyncio
 
 # --- 설정 ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# SEC EDGAR API는 식별을 위한 User-Agent를 요구합니다.
 SEC_USER_AGENT = "My Discord Bot myemail@example.com"
 
 # --- Gemini API 설정 ---
@@ -26,6 +25,31 @@ gemini_model = genai.GenerativeModel('gemini-pro-latest')
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
+
+# --- SEC API 헬퍼 ---
+# Ticker -> CIK 변환을 위한 캐시
+ticker_to_cik_map = {}
+
+async def _ensure_cik_map_loaded():
+    """메모리에 Ticker-CIK 맵이 없으면 로드합니다."""
+    global ticker_to_cik_map
+    if ticker_to_cik_map:
+        return
+
+    print("Fetching and caching SEC company tickers...")
+    url = "https://www.sec.gov/files/company_tickers.json"
+    headers = {"User-Agent": SEC_USER_AGENT}
+    
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.get(url) as response:
+            response.raise_for_status()
+            data = await response.json()
+            # Ticker를 key로, CIK를 value로 하는 맵 생성
+            ticker_to_cik_map = {
+                item['ticker']: str(item['cik_str']).zfill(10)
+                for item in data.values()
+            }
+    print("SEC company tickers cached successfully.")
 
 # --- 뉴스 피드 파싱 함수 ---
 def fetch_news_from_rss(url):
@@ -53,6 +77,8 @@ def fetch_news_from_rss(url):
 async def on_ready():
     print(f'{bot.user} (으)로 로그인했습니다!')
     try:
+        # 봇이 준비되면 CIK 맵을 미리 로드합니다.
+        await _ensure_cik_map_loaded()
         synced = await bot.tree.sync()
         print(f"{len(synced)}개의 슬래시 커맨드를 동기화했습니다.")
     except Exception as e:
@@ -137,59 +163,71 @@ async def info(interaction: discord.Interaction, 종목코드: str):
     embed.add_field(name="📈 베타 (Beta)", value=get_info('beta', "{:.2f}"), inline=True)
     await interaction.followup.send(embed=embed)
 
-def get_sec_filings_sync(ticker, filing_type):
-    """동기적으로 SEC 공시를 가져오는 함수 (secedgar 라이브러리 사용)"""
-    try:
-        ft = FilingType(filing_type.upper()) if filing_type else FilingType.FILINGS
-        filings = get_filings(
-            cik_lookup=ticker,
-            filing_type=ft,
-            user_agent=SEC_USER_AGENT,
-            count=8 
-        )
-        return filings
-    except ValueError:
-        return "InvalidFilingType"
-    except Exception as e:
-        print(f"SEC Edgar 조회 중 오류: {e}")
-        return None
-
 @bot.tree.command(name="sec", description="기업의 최신 SEC 공시를 봅니다.")
 @app_commands.describe(종목코드="공시 조회를 원하는 종목의 코드를 입력하세요.", 유형="특정 공시 유형만 봅니다 (예: 10-K, 10-Q, 8-K 등).")
 async def sec_filings(interaction: discord.Interaction, 종목코드: str, 유형: str = None):
     await interaction.response.defer()
-    loop = asyncio.get_running_loop()
+    ticker = 종목코드.upper()
+
     try:
-        filings = await loop.run_in_executor(
-            None, get_sec_filings_sync, 종목코드, 유형
-        )
-        if filings is None:
-            await interaction.followup.send(f"'{종목코드}'에 대한 SEC 공시를 찾을 수 없거나 조회 중 오류가 발생했습니다. 티커를 확인해주세요.")
-            return
-        if filings == "InvalidFilingType":
-            await interaction.followup.send(f"'{유형}'은(는) 유효한 공시 유형이 아닙니다. `10-K`, `10-Q`, `8-K` 등을 시도해보세요.")
+        # CIK 맵 로드 보장
+        await _ensure_cik_map_loaded()
+        
+        cik = ticker_to_cik_map.get(ticker)
+        if not cik:
+            await interaction.followup.send(f"'{ticker}'에 해당하는 CIK 코드를 찾을 수 없습니다. 올바른 종목코드인지 확인해주세요.")
             return
 
+        # SEC API 호출
+        url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+        headers = {"User-Agent": SEC_USER_AGENT}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    await interaction.followup.send(f"SEC API에서 정보를 가져오는 데 실패했습니다. (상태 코드: {response.status})")
+                    return
+                data = await response.json()
+
+        # 데이터 파싱 및 필터링
+        recent_filings = data['filings']['recent']
+        filings_list = []
+        for i in range(len(recent_filings['accessionNumber'])):
+            filing_data = {
+                'accessionNumber': recent_filings['accessionNumber'][i],
+                'filingDate': recent_filings['filingDate'][i],
+                'form': recent_filings['form'][i],
+                'primaryDocument': recent_filings['primaryDocument'][i]
+            }
+            # 유형 필터링
+            if 유형 and 유형.upper() not in filing_data['form'].upper():
+                continue
+            filings_list.append(filing_data)
+
+        if not filings_list:
+            await interaction.followup.send(f"'{ticker}'에 대한 '{유형 or '최신'}' 공시를 찾을 수 없습니다.")
+            return
+
+        # 임베드 생성
         embed = discord.Embed(
-            title=f"**{종목코드.upper()}** - 최신 SEC 공시 ({유형 or '모든 유형'})",
+            title=f"**{ticker}** - 최신 SEC 공시 ({유형 or '모든 유형'})",
             color=discord.Color.dark_blue()
         )
-        if not filings:
-             await interaction.followup.send(f"'{종목코드}'에 대한 '{유형 or '최신'}' 공시를 찾을 수 없습니다.")
-             return
         
-        for filing in filings:
-            filing_date = filing.filing_date.strftime('%Y-%m-%d')
-            # secedgar는 get_url() 메소드를 제공하지 않으므로 직접 구성
-            url = filing.get_filing_url()
+        for filing in filings_list[:8]: # 최신 8개만 표시
+            accession_no_hyphens = filing['accessionNumber'].replace('-', '')
+            doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_hyphens}/{filing['primaryDocument']}"
             embed.add_field(
-                name=f"📄 {filing.form_type} ({filing_date})",
-                value=f"[문서 링크]({url})",
+                name=f"📄 {filing['form']} ({filing['filingDate']})",
+                value=f"[문서 링크]({doc_url})",
                 inline=False
             )
+        
         await interaction.followup.send(embed=embed)
+
     except Exception as e:
-        await interaction.followup.send(f"공시를 처리하는 중 오류가 발생했습니다: {e}")
+        print(f"SEC 명령어 처리 중 오류 발생: {e}")
+        await interaction.followup.send(f"공시 정보를 처리하는 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
+
 
 @bot.tree.command(name="종목뉴스", description="특정 종목에 대한 최신 뉴스를 검색합니다.")
 @app_commands.describe(종목명="뉴스를 검색할 종목명을 입력하세요.")
