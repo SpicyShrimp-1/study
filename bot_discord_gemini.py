@@ -9,12 +9,11 @@ import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 import google.generativeai as genai
-from sec_edgar.filings import get_filings, FilingType
+from secedgar.filings import get_filings, FilingType
 import asyncio
 
 # --- 설정 ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-# 중요: Replit의 Secrets에 Gemini API 키를 설정하세요.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 # SEC EDGAR API는 식별을 위한 User-Agent를 요구합니다.
 SEC_USER_AGENT = "My Discord Bot myemail@example.com"
@@ -68,7 +67,6 @@ async def ask_gemini(interaction: discord.Interaction, 질문내용: str):
     await interaction.response.defer()
     try:
         response = await gemini_model.generate_content_async(질문내용)
-        # 답변이 너무 길 경우를 대비하여 2000자 단위로 나누어 전송
         for i in range(0, len(response.text), 2000):
             await interaction.followup.send(response.text[i:i+2000])
     except Exception as e:
@@ -100,18 +98,11 @@ async def price(interaction: discord.Interaction, 종목코드: str):
     if len(hist) < 2:
         await interaction.followup.send(f"'{ticker_symbol}'에 대한 데이터가 충분하지 않습니다. 상장된 주식이 맞는지 확인해주세요.")
         return
-    latest = hist.iloc[-1]
-    previous = hist.iloc[-2]
-    current_price = latest['Close']
-    prev_close = previous['Close']
+    latest, previous = hist.iloc[-1], hist.iloc[-2]
+    current_price, prev_close = latest['Close'], previous['Close']
     change = current_price - prev_close
     change_percent = (change / prev_close) * 100
-    if change >= 0:
-        color = discord.Color.red()
-        sign = "▲"
-    else:
-        color = discord.Color.blue()
-        sign = "▼"
+    color, sign = (discord.Color.red(), "▲") if change >= 0 else (discord.Color.blue(), "▼")
     embed = discord.Embed(
         title=f"**{ticker.info.get('longName', ticker_symbol)} ({ticker_symbol})** 가격 정보",
         color=color
@@ -136,11 +127,9 @@ async def info(interaction: discord.Interaction, 종목코드: str):
         title=f"**{info.get('longName', 'N/A')} ({info.get('symbol', 'N/A')})** 핵심 지표",
         color=discord.Color.dark_gold()
     )
-    def get_info(key, format_str="{}"):
+    def get_info(key, fmt="{}"):
         val = info.get(key)
-        if val is None or val == 0:
-            return "N/A"
-        return format_str.format(val)
+        return fmt.format(val) if val else "N/A"
     embed.add_field(name="📊 거래량", value=get_info('volume', "{:,}"), inline=True)
     embed.add_field(name="↕️ 52주 변동폭", value=f"{get_info('fiftyTwoWeekLow', '{:,.2f}')} - {get_info('fiftyTwoWeekHigh', '{:,.2f}')}", inline=False)
     embed.add_field(name="⚖️ 주가수익비율 (P/E)", value=get_info('trailingPE', "{:.2f}"), inline=True)
@@ -148,24 +137,20 @@ async def info(interaction: discord.Interaction, 종목코드: str):
     embed.add_field(name="📈 베타 (Beta)", value=get_info('beta', "{:.2f}"), inline=True)
     await interaction.followup.send(embed=embed)
 
-# --- SEC 공시 조회 ---
 def get_sec_filings_sync(ticker, filing_type):
-    """동기적으로 SEC 공시를 가져오는 함수 (Executor에서 실행될 것)"""
+    """동기적으로 SEC 공시를 가져오는 함수 (secedgar 라이브러리 사용)"""
     try:
-        # FilingType enum을 문자열로부터 얻기
-        ft = FilingType(filing_type.upper()) if filing_type else None
-        
-        # filing_type이 주어졌으면 해당 타입으로, 아니면 모든 타입의 공시를 가져옴
+        ft = FilingType(filing_type.upper()) if filing_type else FilingType.FILINGS
         filings = get_filings(
-            ticker=ticker,
+            cik_lookup=ticker,
+            filing_type=ft,
             user_agent=SEC_USER_AGENT,
-            filing_type=ft
+            count=8 
         )
         return filings
-    except ValueError: # 유효하지 않은 filing_type
+    except ValueError:
         return "InvalidFilingType"
     except Exception as e:
-        # sec-edgar 라이브러리는 다양한 예외를 발생시킬 수 있음
         print(f"SEC Edgar 조회 중 오류: {e}")
         return None
 
@@ -173,42 +158,36 @@ def get_sec_filings_sync(ticker, filing_type):
 @app_commands.describe(종목코드="공시 조회를 원하는 종목의 코드를 입력하세요.", 유형="특정 공시 유형만 봅니다 (예: 10-K, 10-Q, 8-K 등).")
 async def sec_filings(interaction: discord.Interaction, 종목코드: str, 유형: str = None):
     await interaction.response.defer()
-    
     loop = asyncio.get_running_loop()
-    # 동기 함수를 비동기적으로 실행하여 봇이 멈추는 것을 방지
-    filings = await loop.run_in_executor(
-        None, get_sec_filings_sync, 종목코드, 유형
-    )
-
-    if filings is None:
-        await interaction.followup.send(f"'{종목코드}'에 대한 SEC 공시를 찾을 수 없거나 조회 중 오류가 발생했습니다. 티커가 올바른지 확인해주세요.")
-        return
-    if filings == "InvalidFilingType":
-        await interaction.followup.send(f"'{유형}'은(는) 유효한 공시 유형이 아닙니다. `10-K`, `10-Q`, `8-K` 등을 시도해보세요.")
-        return
-
     try:
-        filing_docs = filings.get_documents()
-        if not filing_docs:
-            await interaction.followup.send(f"'{종목코드}'에 대한 '{유형 or '최신'}' 공시를 찾을 수 없습니다.")
+        filings = await loop.run_in_executor(
+            None, get_sec_filings_sync, 종목코드, 유형
+        )
+        if filings is None:
+            await interaction.followup.send(f"'{종목코드}'에 대한 SEC 공시를 찾을 수 없거나 조회 중 오류가 발생했습니다. 티커를 확인해주세요.")
+            return
+        if filings == "InvalidFilingType":
+            await interaction.followup.send(f"'{유형}'은(는) 유효한 공시 유형이 아닙니다. `10-K`, `10-Q`, `8-K` 등을 시도해보세요.")
             return
 
         embed = discord.Embed(
             title=f"**{종목코드.upper()}** - 최신 SEC 공시 ({유형 or '모든 유형'})",
             color=discord.Color.dark_blue()
         )
-
-        # 최신 8개의 공시만 보여줌
-        for doc in filing_docs[:8]:
-            filing_date = doc.filing_date.strftime('%Y-%m-%d')
+        if not filings:
+             await interaction.followup.send(f"'{종목코드}'에 대한 '{유형 or '최신'}' 공시를 찾을 수 없습니다.")
+             return
+        
+        for filing in filings:
+            filing_date = filing.filing_date.strftime('%Y-%m-%d')
+            # secedgar는 get_url() 메소드를 제공하지 않으므로 직접 구성
+            url = filing.get_filing_url()
             embed.add_field(
-                name=f"📄 {doc.form_type} ({filing_date})",
-                value=f"[문서 링크]({doc.link})",
+                name=f"📄 {filing.form_type} ({filing_date})",
+                value=f"[문서 링크]({url})",
                 inline=False
             )
-        
         await interaction.followup.send(embed=embed)
-
     except Exception as e:
         await interaction.followup.send(f"공시를 처리하는 중 오류가 발생했습니다: {e}")
 
@@ -246,10 +225,7 @@ async def calendar(interaction: discord.Interaction, 날짜: str = None):
     if 날짜 is None:
         날짜 = datetime.now().strftime('%Y-%m-%d')
     try:
-        if '-' in 날짜:
-            target_date = datetime.strptime(날짜, '%Y-%m-%d')
-        else:
-            target_date = datetime.strptime(날짜, '%Y%m%d')
+        target_date = datetime.strptime(날짜, '%Y-%m-%d') if '-' in 날짜 else datetime.strptime(날짜, '%Y%m%d')
     except ValueError:
         await interaction.followup.send("날짜 형식이 잘못되었습니다. `YYYY-MM-DD` 또는 `YYYYMMDD` 형식으로 입력해주세요.")
         return
